@@ -178,8 +178,9 @@ class MCPSessionManager:
       self._connection_params = connection_params
     self._errlog = errlog
 
-    # Session pool: maps session keys to (session, exit_stack) tuples
+    # Session pool: maps session keys to (session, exit_stack, sid) tuples
     self._sessions: Dict[str, tuple[ClientSession, AsyncExitStack]] = {}
+    self._sids: Dict[str, str] = {}
 
     # Lock to prevent race conditions in session creation
     self._session_lock = asyncio.Lock()
@@ -316,6 +317,7 @@ class MCPSessionManager:
 
     # Generate session key using merged headers
     session_key = self._generate_session_key(merged_headers)
+    sid = self._sids.get(session_key)
 
     # Use async lock to prevent race conditions
     async with self._session_lock:
@@ -341,6 +343,13 @@ class MCPSessionManager:
       exit_stack = AsyncExitStack()
 
       try:
+        # If we already have a sid (e.g., from a previously established session),
+        # attach it to headers for reconnect flows (not applicable to stdio).
+        if sid and not isinstance(self._connection_params, StdioConnectionParams):
+          if merged_headers is None:
+            merged_headers = {}
+          merged_headers["mcp-session-id"] = str(sid)
+
         client = self._create_client(merged_headers)
 
         transports = await exit_stack.enter_async_context(client)
@@ -359,10 +368,17 @@ class MCPSessionManager:
           session = await exit_stack.enter_async_context(
               ClientSession(*transports[:2])
           )
-        await session.initialize()
+
+        if (not sid):
+          await session.initialize()
+          get_session_callback = transports[2] if len(transports) > 2 and callable(transports[2]) else None
+          maybe = get_session_callback()
+          sid = await maybe if asyncio.iscoroutine(maybe) else maybe
+
 
         # Store session and exit stack in the pool
         self._sessions[session_key] = (session, exit_stack)
+        self._sids[session_key] = sid
         logger.debug('Created new session: %s', session_key)
         return session
 
